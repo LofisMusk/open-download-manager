@@ -1,44 +1,43 @@
-name: mekamb-download-manager
+name: open-download-manager
 
 services:
   download-manager:
     build: .
-    container_name: mekamb-download-manager
+    container_name: open-download-manager
     restart: unless-stopped
     labels:
-      # Subdomena w Traefiku: http://downloader.home (DOMAIN=.home z docker/proxy)
+      # Optional Traefik subdomain (e.g. http://downloader.example.com);
+      # remove if you don't use this pattern
       subdomain: downloader
     networks: [default, proxy]
     environment:
-      - TZ=Europe/Warsaw
-      # Login + haslo do web UI (porownywane basic authem)
-      - AUTH_USER=${AUTH_USER:-lofis}
+      # Login + password for the web UI (Basic auth)
+      - AUTH_USER=${AUTH_USER:-admin}
       - AUTH_PASS=${AUTH_PASS:?set AUTH_PASS in .env}
-      # true = odrzuca URL-e prowadzace do IP prywatnych/LAN (SSRF)
+      # true = reject URLs that resolve to private/LAN IPs (SSRF protection);
+      # set false if you download from a NAS on your LAN
       - BLOCK_PRIVATE_IPS=${BLOCK_PRIVATE_IPS:-false}
       - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-3}
-      # Wrapper qBittorrent: API contenera qbittorrent-filmy (ta sama siec proxy).
-      # Nasze pobierania respektuja aktualny limit DL tego klienta (qbt-speed-schedule.sh),
-      # a zakladka "qBittorrent" pozwala patrzec/pauzowac/addowac torrenty.
-      # Puste QBT_PASS = integracja wylaczona.
-      - QBT_API_URL=${QBT_API_URL:-http://qbittorrent-filmy:8081/api/v2}
+      # qBittorrent wrapper: point QBT_API_URL at the WebUI API of your
+      # qBittorrent container (reachable by name on the shared network).
+      # Own downloads then respect that client's current DL limit, and the
+      # "qBittorrent" tab lets you browse/pause/add torrents. Empty QBT_PASS = off.
+      - QBT_API_URL=${QBT_API_URL:-http://qbittorrent:8081/api/v2}
       - QBT_USER=${QBT_USER:-admin}
       - QBT_PASS=${QBT_PASS:-}
-      # Powiadomienia push na telefon przez wlasny ntfy (kontener na sieci proxy,
-      # DNS: "ntfy"). Fire-and-forget po zakonczeniu/porazce pobierania.
-      # Serwer ma login enable -> potrzebne NTFY_USER/NTFY_PASS z prawem zapisu
-      # na temat. Domyślnie temat "serwer" (telefon juz go czyta; patrz
-      # ~/docker/ntfy/credentials.txt). Puste NTFY_TOPIC = wylaczone.
+      # Push notifications via ntfy (same Docker network -> reach it by name).
+      # Fire-and-forget after a download finishes or fails. If your ntfy server
+      # requires login, set NTFY_USER/NTFY_PASS. Empty NTFY_TOPIC = off.
       - NTFY_URL=${NTFY_URL:-http://ntfy}
-      - NTFY_TOPIC=${NTFY_TOPIC:-serwer}
+      - NTFY_TOPIC=${NTFY_TOPIC:-downloads}
       - NTFY_USER=${NTFY_USER:-admin}
       - NTFY_PASS=${NTFY_PASS:-}
     ports:
-      # Bezposredni dostep z LAN (opcjonalny, obok subdomeny)
+      # Direct LAN access (optional, in addition to any subdomain)
       - "${DM_HOST_PORT:-3000}:3000"
     volumes:
-      # Root dir na hoście: pliki leza w /vg_storage/download-mgr/<destination>
-      - /vg_storage/download-mgr:/data
+      # Destination root on the host: files land in ./downloads/<destination>
+      - ./downloads:/data
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
       interval: 30s
@@ -48,4 +47,4 @@ services:
 
 networks:
   proxy:
-    external: true   # siec Traefika z docker/proxy (pattern ten sam jak arr/*)
+    external: true   # shared reverse-proxy network (remove if you don't use one)

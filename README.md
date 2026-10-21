@@ -1,114 +1,136 @@
-# mekamb-download-manager
+# open-download-manager
 
-Prosty web UI do pobierania plików: wklejasz URL, podajesz folder docelowy i klikasz.
-Aplikacja pobiera na serwerze (strumieniowo) i zapisuje atomowo (najpierw `.part`, potem `rename`).
+[![CI](https://github.com/LofisMusk/open-download-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/LofisMusk/open-download-manager/actions/workflows/ci.yml)
 
-## Szybki start (docker compose)
+A simple web UI for downloading files: paste a URL, pick a destination folder and click.
+The app downloads on the server side (streaming) and writes atomically (`.part` file first,
+then `rename`). One dependency (Express), no build step — runs in Docker or plain Node ≥ 20.
+
+## Quick start (docker compose)
 
 ```bash
 cp .env.example .env
-# edytuj .env: ustaw AUTH_USER/AUTH_PASS (login + haslo) i port
+# edit .env: set AUTH_PASS (login password) and optionally the LAN port
 docker compose up -d --build
 ```
 
-Aplikacja działa pod **subdomeną Traefika** (domyślnie `http://downloader.home` — nazwę zmieniasz
-labelem `subdomain:` w docker-compose.yml) oraz bezpośrednio na porcie LAN (`http://HOST:DM_HOST_PORT`).
-Wklej token z `.env` w polu "Access token" na górze strony.
+Then open `http://SERVER:DM_HOST_PORT` and log in with your user/password. The compose file
+ships with an optional Traefik subdomain label (`subdomain: downloader`) — keep or remove it
+depending on whether you run a shared Traefik network (see the `proxy` network at the bottom).
 
-## Środowisko
+## Configuration
 
-| Zmienna | Domyślnie | Opis |
+All settings are environment variables (in `.env` for docker compose):
+
+| Variable | Default | Description |
 |---|---|---|
-| `AUTH_USER` | `lofis` | Login do web UI (Basic auth) |
-| `AUTH_PASS` | *(brak)* | Hasło do web UI. Jeśli puste — brakuje autoryzacji (uwaga w logach) |
-| `DM_HOST_PORT` | `3000` | Port na hoście (w docker-compose.yml) |
-| `BLOCK_PRIVATE_IPS` | `false` | `true` = odrzuca URL-e prowadzące do IP prywatnych/LAN (ochrona przed SSRF); wyłącz, jeśli chcesz pobierać z NAS-a po LAN |
-| `MAX_CONCURRENT_JOBS` | `3` | Maks. równoległych pobierań |
-| `QBT_API_URL` | `http://qbittorrent-filmy:8081/api/v2` | API WebUI kontenera qBittorrenta (ta sama sieć docker `proxy`) |
-| `QBT_USER` / `QBT_PASS` | `admin` / *(brak)* | Logowanie do WebUI qBittorrenta. Puste `QBT_PASS` = integracja wyłączona (zakładka i cap prędkości nieaktywne) |
-| `NTFY_URL` | `http://ntfy` | Adres własnego serwera ntfy (kontener na sieci `proxy`, DNS po nazwie) |
-| `NTFY_TOPIC` | `serwer` | Temat docelowy powiadomień. Pusty = powiadomienia wyłączone |
-| `NTFY_USER` / `NTFY_PASS` | `admin` / *(brak)* | Logowanie do ntfy (serwer ma login enabled → bez tego 401). Hasło patrz `~/docker/ntfy/credentials.txt` |
-| `ROOT_DIR` | `/data` | Korzeń, pod którym leżą foldery docelowe (w kontenerze) |
-| `PORT` | `3000` | Port wewnętrzny kontenera |
+| `AUTH_USER` | `admin` | Login for the web UI (Basic auth) |
+| `AUTH_PASS` | *(empty)* | Password for the web UI. Empty = no authentication at all (warning in logs) |
+| `DM_HOST_PORT` | `3000` | Host port published by docker compose |
+| `BLOCK_PRIVATE_IPS` | `false` | `true` = reject URLs that resolve to private/LAN IPs (SSRF protection); set `false` if you download from a NAS on your LAN |
+| `MAX_CONCURRENT_JOBS` | `3` | Max parallel downloads |
+| `QBT_API_URL` | `http://qbittorrent:8081/api/v2` | WebUI API of your qBittorrent container (must be reachable from this container) |
+| `QBT_USER` / `QBT_PASS` | `admin` / *(empty)* | Login for the qBittorrent WebUI. Empty `QBT_PASS` = integration off (tab and speed cap inactive) |
+| `NTFY_URL` | `http://ntfy` | Address of your ntfy server (Docker DNS name works if both are on the same network) |
+| `NTFY_TOPIC` | `downloads` | Notification topic. Empty = notifications off |
+| `NTFY_USER` / `NTFY_PASS` | `admin` / *(empty)* | Login for ntfy, if your server requires authentication (otherwise requests get 401) |
+| `ROOT_DIR` | `/data` | Root directory inside the container that destinations are resolved against |
+| `PORT` | `3000` | Port inside the container |
 
 ## API
 
-Wszystko pod `/api`, autoryzacja Basic authem (nagłówek `Authorization: Basic base64(login:hasło)`,
-np. z curl: `-u lofis:twoje-haslo`):
+Everything is under `/api`, authenticated with Basic auth
+(`Authorization: Basic base64(login:password)`, e.g. with curl: `-u admin:your-password`):
 
-- `POST /api/jobs` — body `{"url": "https://…", "dest": "optional/sub/dir"}` → `201` z jobem
-- `GET  /api/jobs` — lista jobów + postęp (`receivedBytes`, `totalBytes`)
-- `DELETE /api/jobs/:id` — anulowanie
-- `GET  /api/dirs` — istniejące foldery (podpowiedzi w UI)
+- `POST /api/jobs` — body `{"url": "https://…", "dest": "optional/sub/dir"}` → `201` with the job
+- `GET  /api/jobs` — list of jobs + progress (`receivedBytes`, `totalBytes`)
+- `DELETE /api/jobs/:id` — cancel (or remove a finished history entry and its file)
+- `GET  /api/dirs` — existing folders (autocomplete in the UI)
+- `GET  /api/files?p=…` — browse a folder (files with size/mtime, subfolders)
+- `DELETE /api/file?p=…`, `DELETE /api/dir?p=…` — delete from the download root
 - `GET  /api/status`, `GET /healthz`
-- `GET  /api/qbt/status` — czy qBittorrent jest skonfigurowany/dostępny + aktualny limit DL (B/s, 0 = brak)
-- `GET  /api/qbt/torrents` — torrenty, które nie są jeszcze zakończone (bez seedujących)
-- `POST /api/qbt/torrents` — dodanie: `{"magnet": "magnet:?xt=…"}` albo `{"b64": "<plik .torrent>", "filename": "x.torrent"}`
+- `GET  /api/qbt/status` — qBittorrent configured/reachable + current DL limit (bytes/s, 0 = unlimited)
+- `GET  /api/qbt/torrents` — torrents that are not finished/seeding yet
+- `POST /api/qbt/torrents` — add: `{"magnet": "magnet:?xt=…"}` or `{"b64": "<.torrent file>", "filename": "x.torrent"}`
 - `POST /api/qbt/pause`, `POST /api/qbt/resume` — body `{"hashes": ["…"]}`
 
-## qBittorrent (zakładka + limit prędkości)
+## qBittorrent (tab + speed cap)
 
-Manager jest wrapperem wokół kontenera `qbittorrent-filmy`:
+The manager wraps a real qBittorrent client container:
 
-- **Zakładka „qBittorrent"** — wyświetla torrenty, które są jeszcze w trakcie pobierania
-  (pauzowane/w kolece/meta/error; seedujące nie są pokazywane). Da się je pauzować/wznawiać
-  oraz dodawać nowy torrent przez magnet link albo plik `.torrent`. Operacje idą prosto do
-  API WebUI qBittorrenta — zadania wykonuje faktyczny klient, a nasz manager tylko je przejmuje.
-- **Respektowanie limitów** — co 30 s manager odczytuje z API qBittorrenta aktualny globalny
-  limit pobierania (ten sam, który ustawia `~/docker/arr/scripts/qbt-speed-schedule.sh`:
-  noc bez limitu, w dzień 1 MiB/s / w weekendy 500 KiB/s) i capuje nim **sumę** wszystkich
-  własnych pobierań. Limit widoczny jest jako pasek „Download speed cap" w UI.
-  Jeśli qBittorrent nie odpowiada (2 odświeżenia z rzędu) — limit znoszony, pobieranie bez ograniczeń.
-- Kod jest kompatybilny z Web API v4 i ≥5 (nazwy endpointów `pause`/`stop`, parametr `mt`/`urls`).
+- **qBittorrent tab** — shows torrents that are still in progress (paused/queued/meta/error;
+  seeding ones are hidden). They can be paused/resumed, and new torrents added via magnet link
+  or `.torrent` file. Operations go straight to the qBittorrent WebUI API — the real client does
+  the work, this manager just relays it.
+- **Speed limit mirroring** — every 30 s the manager reads the current global download limit
+  from the qBittorrent API (e.g. the one set by your own schedule script) and caps the
+  **combined** rate of all its own downloads with it. The effective limit is shown as a
+  "Download speed cap" banner in the UI. If qBittorrent stops answering (2 refreshes in a row),
+  the cap is lifted.
+- Compatible with Web API v4 and ≥5 (`pause`/`stop` endpoint names, `mt`/`urls` parameter).
 
-## ntfy (powiadomienia na telefon)
+## ntfy (push notifications)
 
-Po zakończeniu pobierania manager wysyła push na własny serwer ntfy
-(`http://ntfy.home` — temat `serwer`, który odczytuje telefon):
+When a download ends, the manager pushes a notification to your self-hosted ntfy server:
 
-- **Pobranie zakończone** → tytuł „Download finished” + ścieżka pliku i rozmiar.
-- **Pobranie nie powiodło się** → „Download failed” (wyższy priorytet) + błąd.
-- Anulowane joby (kliknięcie 🗑 podczas pobierania) nie wysyłają niczego.
+- **Download finished** → title "Download finished" + file path and size.
+- **Download failed** → "Download failed" (higher priority) + the error message.
+- Cancelled jobs (🗑 clicked mid-download) stay silent.
 
-Wysyłka jest fire-and-forget z timeoutem 5 s — padnięty ntfy nigdy nie psuje
-zakończenia pobierania, a jedynie zostaje wpis w logach. Autoryzacja: Basic auth
-serwera ntfy (domyślnie konto `admin` z `~/docker/ntfy/credentials.txt`).
+The push is fire-and-forget with a 5 s timeout — a dead ntfy never breaks a job completion, it
+only leaves a line in the logs. Authentication: Basic auth of your ntfy server (if login is
+enabled there).
 
-## Ścieżki plików
+## File paths & naming
 
-- `dest` jest względem `ROOT_DIR`; folder tworzony automatycznie.
-- Nazwa pliku: z nagłówka `Content-Disposition`, inaczej z URL-a. Kolizje dostają sufiks `-1`, `-2`, …
-- Pobieranie kończy się atomowym `rename` — po awarii zostaje tylko `.part`.
+- `dest` is relative to `ROOT_DIR`; folders are created automatically.
+- File name comes from `Content-Disposition`, otherwise from the URL. Name collisions get a
+  `-1`, `-2`, … suffix.
+- A download finishes with an atomic `rename` — after a crash only a `.part` file remains.
 
-## Bezpieczeństwo
+## Security
 
-- Kontener działa jako nie-root (user `node`, uid 1000).
-- Autoryzacja tokenem porównywana `timingSafeEqual` (hash SHA-256, brak wycieku długości).
-- Tylko `http:`/`https:`; opcjonalny filtr SSRF na IP prywatne.
-- Walidacja ścieżki docelowej + ochrona przed ucieczką przez symlink (`realpath`).
-- Ograniczenie body do 4 MB (pod uploady `.torrent`), limit równoległych jobów, watchdog (job bez danych >15 min → abort).
-- CSP `default-src 'self'`, `nosniff`, brak inline scriptów.
+- Container runs as non-root (`node` user, uid 1000).
+- Credentials compared with `timingSafeEqual` (SHA-256 hashes, no length leak).
+- Only `http:`/`https:`; optional SSRF filter for private IPs.
+- Destination path validation + symlink escape protection (`realpath`).
+- 4 MB body limit (for `.torrent` uploads), concurrent-job limit, idle watchdog
+  (job without data for >15 min → abort).
+- CSP `default-src 'self'`, `nosniff`, no inline scripts.
 
-## Deployment na serwer
+## Deployment notes
 
-Serwer używa wzorca z Traefikiem (por. `~/docker/proxy`): usługa trafia do katalogu
-`~/docker/<nazwa>`, labelem `subdomain:` dostaje subdomenę i dołącza do zewnętrznej sieci `proxy`.
+The compose file follows a common self-hosted pattern: the service joins an external Docker
+network named `proxy` (the one your reverse proxy/Traefik uses), so it can reach sibling
+containers (qBittorrent, ntfy) by name. If you don't use that pattern, remove the `proxy`
+entry from `networks:` — LAN access via `DM_HOST_PORT` works either way.
 
-```bash
-rsync -a --exclude node_modules --exclude .git ./ lofis@192.168.0.107:~/docker/download-manager/
-ssh lofis@192.168.0.107 'cd ~/docker/download-manager && cp .env.example .env'
-# ustaw AUTH_USER i AUTH_PASS w .env, potem:
-ssh lofis@192.168.0.107 'cd ~/docker/download-manager && docker compose up -d --build'
-```
+Adjust the `volumes:` line to wherever you want the files to live on the host
+(the example uses `./downloads`).
 
-Efekt: http://downloader.home oraz http://192.168.0.107:3000 (LAN).
-
-## Testy lokalne (bez dockera)
+## Running without Docker (development)
 
 ```bash
 npm install
 ROOT_DIR=/tmp/dm-test AUTH_USER=admin AUTH_PASS=pass PORT=3999 node server.js
-# logowanie: admin / pass
+# login: admin / pass
 # http://localhost:3999
 ```
+
+Smoke test (starts the real server, downloads a file end-to-end):
+
+```bash
+npm test
+```
+
+## CI/CD
+
+GitHub Actions (`.github/workflows/ci.yml`): on push to `main` and on tags it runs the smoke
+test, then builds and pushes the Docker image to GHCR:
+
+- `ghcr.io/lofismusk/open-download-manager:<short-sha>` — every push to `main` / tag
+- `ghcr.io/lofismusk/open-download-manager:latest` — main branch
+- `ghcr.io/lofismusk/open-download-manager:vX.Y.Z` — version tags
+
+Pull it with `docker pull ghcr.io/lofismusk/open-download-manager:latest` if you prefer running
+the prebuilt image over building locally.
