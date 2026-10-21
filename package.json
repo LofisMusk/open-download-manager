@@ -1,0 +1,16 @@
+{
+  "name": "mekamb-download-manager",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Simple web UI to download files by URL into a chosen destination folder",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

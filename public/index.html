@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Download Manager</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+
+  <!-- Ekran logowania (pokazywany przed calym UI) -->
+  <div id="login-screen" hidden>
+    <form id="auth-form">
+      <h1>⬇ Download Manager</h1>
+      <input id="user" type="text" placeholder="Username" autocomplete="username" required />
+      <input id="pass" type="password" placeholder="Password" autocomplete="current-password" required />
+      <button type="submit">Log in</button>
+      <span id="auth-error"></span>
+    </form>
+  </div>
+
+  <!-- Glowny interfejs (po zalogowaniu) -->
+  <div id="app" hidden>
+    <header>
+      <h1>⬇ Download Manager</h1>
+      <a id="logout" href="#">Log out</a>
+    </header>
+
+    <main>
+      <form id="add-form">
+        <label for="url">File URL (http/https)</label>
+        <input id="url" type="text" autocomplete="off" spellcheck="false"
+               placeholder="https://example.com/file.zip" required />
+
+        <label for="dest">Destination folder</label>
+        <input id="dest" type="text" list="dest-list" autocomplete="off" spellcheck="false"
+               placeholder="(root)" />
+        <datalist id="dest-list"></datalist>
+
+        <div class="row">
+          <button type="submit" id="add-btn">Download</button>
+          <small>Paths are relative to the server download root.<br/>
+            New folders can be typed freely — they are created automatically.</small>
+        </div>
+      </form>
+
+      <section id="panels">
+        <div class="tabs">
+          <button type="button" id="tab-dl" class="tab active">Downloads</button>
+          <button type="button" id="tab-lib" class="tab">Library</button>
+          <button type="button" id="tab-qbt" class="tab">qBittorrent</button>
+        </div>
+
+        <div id="speedcap" class="speedcap" hidden></div>
+
+        <div id="panel-dl">
+          <div id="jobs"></div>
+        </div>
+
+        <div id="panel-lib" hidden>
+          <nav id="lib-breadcrumb" class="breadcrumb"></nav>
+          <div id="lib-content"></div>
+        </div>
+
+        <div id="panel-qbt" hidden>
+          <form id="qbt-add-form" class="qbt-add">
+            <input id="qbt-magnet" type="text" autocomplete="off" spellcheck="false"
+                   placeholder="Magnet link (magnet:?xt=urn:btih:...)" />
+            <label class="qbt-file-label" for="qbt-file">or .torrent file</label>
+            <input id="qbt-file" type="file" accept=".torrent,application/x-bittorrent" hidden />
+            <button type="submit" id="qbt-add-btn">Add torrent</button>
+          </form>
+          <span id="qbt-error"></span>
+          <div id="qbt-list"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
