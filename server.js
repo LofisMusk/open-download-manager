@@ -187,8 +187,9 @@ function newJob(url, dir) {
 }
 
 function pruneFinished() {
+  // interrupted jobs hold a resumable .part file on disk - never auto-drop them
   const finished = [...jobs.values()]
-    .filter(j => j.state !== 'active')
+    .filter(j => j.state !== 'active' && j.state !== 'interrupted')
     .sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0));
   for (const j of finished.slice(MAX_FINISHED_KEPT)) {
     jobs.delete(j.id);
@@ -202,7 +203,7 @@ function serializeJob(job) {
     url: job.url,
     state: job.state,
     receivedBytes: job.receivedBytes,
-    totalBytes: job.totalBytes,
+    totalBytes: job.totalBytes ?? null,
     file: job.fileSize || null,
     error: job.error,
     startedAt: job.startedAt,
@@ -239,9 +240,10 @@ function notifyNtfy(title, message, { priority = null, tags = '' } = {}) {
   });
 }
 
-/** Push a notification for a finished job. Cancels are skipped (user-initiated). */
+/** Push a notification for a finished job. Cancels are skipped (user-initiated),
+ *  interrupted jobs are announced separately by the shutdown handler. */
 function announceJob(job) {
-  if (job.state === 'cancelled') return;
+  if (job.state === 'cancelled' || job.state === 'interrupted') return;
   if (job.state === 'done') {
     notifyNtfy('Download finished', `${job.fileSize} (${humanBytes(job.receivedBytes)})`, { tags: 'white_check_mark' });
   } else {
@@ -327,21 +329,67 @@ class Throttle extends Transform {
   }
 }
 
+/** Sidecar metadata written next to every .part file so that an interrupted
+ *  download can be identified and resumed after a server restart/redeploy. */
+const metaPathOf = (partPath) => `${partPath}.meta.json`;
+
+async function writeJobMeta(job) {
+  if (!job.finalPath) return; // target name not decided yet -> nothing to persist
+  const payload = JSON.stringify({
+    v: 1,
+    url: job.url,
+    destRel: path.relative(ROOT_DIR, job.dir).split(path.sep).join('/'),
+    finalName: job.finalPath,
+    totalBytes: job.totalBytes,
+    startedAt: job.startedAt,
+  });
+  await fsp.writeFile(metaPathOf(job.partPath), payload);
+}
+
 async function runJob(job) {
   const relReserve = (name) => path.relative(ROOT_DIR, name);
   let limiter; // declared before the try so the outer finally can destroy() it
+  let offset = 0; // bytes already in the .part file (resume support)
   try {
     if (BLOCK_PRIVATE_IPS) {
       await maybeBlockSsrf(new URL(job.url).hostname);
     }
+    // resume: continue from wherever a previous attempt left off on disk
+    try { const st = await fsp.stat(job.partPath); if (st.size > 0) offset = st.size; } catch { /* fresh download */ }
+
     let res;
-    try {
-      res = await fetch(job.url, { redirect: 'follow', signal: job.controller.signal });
-    } catch (e) {
-      if (job.cancelRequested || job.controller.signal.aborted) throw new Job('cancelled');
-      throw e;
+    for (;;) {
+      let r;
+      try {
+        r = await fetch(job.url, {
+          redirect: 'follow',
+          signal: job.controller.signal,
+          headers: offset > 0 ? { Range: `bytes=${offset}-` } : {},
+        });
+      } catch (e) {
+        if (job.cancelRequested || job.controller.signal.aborted) throw new Job('cancelled');
+        throw e;
+      }
+      // If we asked for a continuation but the server's answer doesn't line up with
+      // what is on disk, discard the partial and start over from byte 0:
+      //   200     - Range header ignored (full body sent again)
+      //   416     - file shrank below our offset
+      //   bad CR  - server claims a different start position / total size
+      if (offset > 0) {
+        const cr = r.status === 206 ? (r.headers.get('content-range') || '').match(/^bytes (\d+)-\d*\/(\d+|\*)\s*$/) : null;
+        if (r.status !== 206 || !cr || Number(cr[1]) !== offset ||
+            (job.totalBytes != null && cr[2] !== '*' && Number(cr[2]) !== job.totalBytes)) {
+          await r.body?.cancel().catch(() => {}); // discard the mismatched stream before re-fetching
+          offset = 0;
+          job.receivedBytes = 0;
+          continue;
+        }
+        if (cr[2] !== '*') job.totalBytes = Number(cr[2]);
+      }
+      if (!r.ok) throw new Job(`HTTP ${r.status} ${r.statusText}`.trim());
+      res = r;
+      break;
     }
-    if (!res.ok) throw new Job(`HTTP ${res.status} ${res.statusText}`.trim());
 
     const finalUrl = new URL(res.url);
     if (finalUrl.protocol !== 'http:' && finalUrl.protocol !== 'https:') {
@@ -356,14 +404,21 @@ async function runJob(job) {
     }
     if (!name) name = `download-${new Date(job.startedAt).toISOString().replace(/[:.]/g, '-')}`;
 
-    const finalPath = uniqueFinalPath(job.dir, name);
+    // resume: keep the previous attempt's target name when it is still free
+    const prevName = offset > 0 && job.finalPath ? path.join(job.dir, job.finalPath) : null;
+    let finalPath;
+    if (prevName && !fs.existsSync(prevName)) finalPath = prevName;
+    else finalPath = uniqueFinalPath(job.dir, name);
     job.finalPath = path.basename(finalPath);
     reserved.add(path.join(job.dir, job.finalPath));
 
-    const cl = res.headers.get('content-length');
-    if (cl !== null && Number.isFinite(parseInt(cl, 10))) job.totalBytes = parseInt(cl, 10);
+    if (offset === 0) {
+      const cl = res.headers.get('content-length');
+      if (cl !== null && Number.isFinite(parseInt(cl, 10))) job.totalBytes = parseInt(cl, 10);
+    }
 
-    const out = fs.createWriteStream(job.partPath);
+    await writeJobMeta(job); // keep the sidecar in sync (also rewrites it on resume)
+    const out = fs.createWriteStream(job.partPath, { flags: offset > 0 ? 'a' : 'w' });
     try {
       const src = Readable.fromWeb(res.body);
       limiter = new Throttle(); // caps combined rate at qBittorrent's current DL limit
@@ -388,23 +443,32 @@ async function runJob(job) {
 
     // atomic rename into place
     await fsp.rename(job.partPath, finalPath);
+    await fsp.unlink(metaPathOf(job.partPath)).catch(() => {});
     job.fileSize = relReserve(finalPath);
     job.state = 'done';
   } catch (e) {
-    if (job.cancelRequested || (job.controller.signal.aborted && job.error !== 'timeout')) {
+    if (shuttingDown) {
+      // graceful stop: keep the .part file so the next start can resume it
+      job.state = 'interrupted';
+    } else if (job.cancelRequested || (job.controller.signal.aborted && job.error !== 'timeout')) {
       job.state = 'cancelled';
       job.error = e.message === 'cancelled' ? null : (job.error || e.message);
     } else {
       job.state = 'error';
       job.error = e.name === 'AbortError' ? (job.error || 'aborted') : e.message;
     }
-    await fsp.unlink(job.partPath).catch(() => {});
+    if (job.state !== 'interrupted') {
+      await fsp.unlink(job.partPath).catch(() => {});
+      await fsp.unlink(metaPathOf(job.partPath)).catch(() => {});
+    }
   } finally {
     if (limiter) limiter.destroy();
     if (job.finalPath) reserved.delete(path.join(job.dir, job.finalPath));
     job.finishedAt = Date.now();
-    announceJob(job); // ntfy push: finished / failed (cancels skipped)
-    pruneFinished();
+    if (!shuttingDown) {
+      announceJob(job); // ntfy push: finished / failed (cancels skipped)
+      pruneFinished();
+    }
   }
 }
 
@@ -417,6 +481,95 @@ setInterval(() => {
     }
   }
 }, 30 * 1000).unref();
+
+// ---------------------------------------------------------------------------
+// Restart recovery + graceful shutdown
+//
+// Job state is in memory, so a container redeploy (docker compose up / build)
+// or power loss mid-download used to leave orphaned *.part files behind that
+// nothing referenced anymore. The fix has two halves:
+//   1. shutdown handler: on SIGTERM/SIGINT, running jobs are kept as
+//      "interrupted" instead of being cleaned up -> the part stays resumable.
+//   2. startup sweep: leftover *.part files become "interrupted" jobs again
+//      (url/final name from their .meta.json sidecar when present).
+// A hard kill during shutdown is covered too: the sidecar is written as soon
+// as a download starts, so even SIGKILL leaves a resumable entry.
+// ---------------------------------------------------------------------------
+let shuttingDown = false;
+
+function gracefulShutdown(sig) {
+  if (shuttingDown) return process.exit(143); // second signal -> force exit
+  shuttingDown = true;
+  const inFlight = [...jobs.values()].filter((j) => j.state === 'active');
+  console.log(`${sig} received - ${inFlight.length} in-flight download(s) kept as resumable`);
+  for (const job of inFlight) {
+    if (job.finalPath) {
+      const rel = path.relative(ROOT_DIR, job.dir);
+      const where = rel ? `${rel}/` : '';
+      notifyNtfy('Download paused', `${where}${job.finalPath} - ${humanBytes(job.receivedBytes)} downloaded, resumable from the web UI`, { tags: 'pause_circle' });
+    }
+    job.cancelRequested = true; // let runJob() abort its stream promptly (catch keeps state "interrupted")
+    job.controller.abort();
+  }
+  setTimeout(() => process.exit(143), 3000).unref(); // streams should settle within the grace period
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+/** Collect *.part files under dir (symlinked subdirs are skipped, count-capped). */
+async function findPartFiles(dir, out, cap) {
+  let entries;
+  try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+  for (const e of entries) {
+    if (out.length >= cap) return;
+    const abs = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      if (!e.isSymbolicLink()) await findPartFiles(abs, out, cap);
+    } else if (e.isFile() && e.name.endsWith('.part')) {
+      out.push(abs);
+    }
+  }
+}
+
+/** Rebuild "interrupted" jobs from leftover *.part files. Run once at startup. */
+async function recoverJobs() {
+  const parts = [];
+  await findPartFiles(ROOT_DIR, parts, 5000);
+  let recovered = 0;
+  for (const part of parts) {
+    const dir = path.dirname(part);
+    let meta = null;
+    try {
+      const parsed = JSON.parse(await fsp.readFile(metaPathOf(part), 'utf8'));
+      if (parsed && parsed.v === 1 && typeof parsed.url === 'string') meta = parsed;
+    } catch { /* no sidecar - orphan from before metadata existed */ }
+    const st = await fsp.stat(part).catch(() => null);
+    if (!st) continue;
+
+    // keep the original job id (it is embedded in the .part file name), so jobs
+    // stay referenceable across restarts
+    const fresh = newJob(meta ? meta.url : '(unknown - metadata lost, safe to delete)', dir);
+    jobs.delete(fresh.id);
+    const job = Object.assign(fresh, { id: path.basename(part).slice(0, -'.part'.length) });
+    jobs.set(job.id, job);
+    job.partPath = part; // keep the actual on-disk file, not a fresh UUID name
+    job.state = 'interrupted';
+    job.receivedBytes = st.size;
+    job.totalBytes = meta && Number.isFinite(meta.totalBytes) ? meta.totalBytes : null;
+    job.startedAt = (meta && meta.startedAt) || Math.round(st.mtimeMs);
+    if (meta && typeof meta.finalName === 'string') {
+      const prev = path.join(dir, meta.finalName);
+      if (!fs.existsSync(prev) && !reserved.has(prev)) {
+        job.finalPath = meta.finalName;
+        reserved.add(prev);
+      }
+    }
+    recovered += 1;
+  }
+  if (recovered) console.log(`recovery: ${recovered} interrupted download(s) restored from *.part files`);
+}
+
+void recoverJobs(); // fast (few stat/read calls); jobs appear within milliseconds of boot
 
 // ---------------------------------------------------------------------------
 // App & security middleware
@@ -675,6 +828,29 @@ app.get('/api/jobs', (req, res) => {
   res.json(all.map(serializeJob));
 });
 
+/** Continue an interrupted download (e.g. after a server restart/redeploy). */
+app.post('/api/jobs/:id/resume', async (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'not found' });
+  if (job.state !== 'interrupted') {
+    return res.status(400).json({ error: `only interrupted downloads can be resumed (state: ${job.state})` });
+  }
+  const active = [...jobs.values()].filter((j) => j.state === 'active').length;
+  if (active >= MAX_CONCURRENT_JOBS) {
+    return res.status(429).json({ error: `max ${MAX_CONCURRENT_JOBS} concurrent downloads reached` });
+  }
+  try { validateUrl(job.url); } catch (e) { return res.status(400).json({ error: e.message }); }
+
+  job.state = 'active';
+  job.error = null;
+  job.cancelRequested = false;
+  job.controller = new AbortController();
+  job.startedAt = Date.now();
+  job.lastActivity = Date.now();
+  runJob(job); // resume: picks up from the current .part size (or starts over if it vanished)
+  res.json(serializeJob(job));
+});
+
 app.delete('/api/jobs/:id', async (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'not found' });
@@ -685,6 +861,9 @@ app.delete('/api/jobs/:id', async (req, res) => {
   }
   // finished/cancelled/error history entry: remove the file and clear the entry
   if (job.finalPath) await fsp.unlink(path.join(job.dir, job.finalPath)).catch(() => {});
+  await fsp.unlink(job.partPath).catch(() => {});        // interrupted jobs keep their partial
+  await fsp.unlink(metaPathOf(job.partPath)).catch(() => {});
+  if (job.finalPath) reserved.delete(path.join(job.dir, job.finalPath));
   jobs.delete(req.params.id);
   res.json({ ok: true });
 });

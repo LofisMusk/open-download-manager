@@ -86,7 +86,21 @@ enabled there).
 - `dest` is relative to `ROOT_DIR`; folders are created automatically.
 - File name comes from `Content-Disposition`, otherwise from the URL. Name collisions get a
   `-1`, `-2`, … suffix.
-- A download finishes with an atomic `rename` — after a crash only a `.part` file remains.
+- A download finishes with an atomic `rename`, so the final file is never half-written.
+
+### Interrupted downloads (restart / redeploy safety)
+
+Jobs are tracked in memory, but every running download writes a small `<id>.part.meta.json`
+sidecar next to its `.part` file. On startup, leftover `.part` files are restored as
+**interrupted** jobs, so a `docker compose up`/rebuild mid-download (or a power loss) leaves
+nothing orphaned on disk:
+
+- the UI shows the interrupted job with the downloaded/total size and a **Resume** button
+  (`POST /api/jobs/:id/resume`) — resume continues via HTTP `Range`; if the server ignores
+  Range or the file changed, it transparently starts over from byte 0;
+- on `SIGTERM`/`SIGINT` in-flight downloads are kept as resumable (second signal force-exits),
+  and ntfy announces a "Download paused" for each of them;
+- deleting an interrupted job (🗑) removes the partial file and reclaims its space.
 
 ## Security
 
@@ -107,6 +121,20 @@ entry from `networks:` — LAN access via `DM_HOST_PORT` works either way.
 
 Adjust the `volumes:` line to wherever you want the files to live on the host
 (the example uses `./downloads`).
+
+### Updating / auto-deploy
+
+The compose file pulls the image CI pushes on every push to `main`:
+
+```bash
+docker compose pull && docker compose up -d   # update in place (safe mid-download:
+                                              # running jobs are kept as resumable)
+```
+
+Optionally, the CI workflow deploys by itself after each image push. Enable it by setting
+repo variables `DM_DEPLOY_HOST` + `DM_DEPLOY_USER` and secret `DM_DEPLOY_SSH_KEY`
+(a deploy key for the server user). The host must be reachable from GitHub's runners
+(Tailscale or a port forward) — keep it in the variable, not in the workflow file.
 
 ## Running without Docker (development)
 

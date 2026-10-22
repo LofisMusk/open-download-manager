@@ -186,15 +186,26 @@ function renderJobs(jobs) {
         done: '<span class="badge badge-done">done</span>',
         cancelled: '<span class="badge badge-cancelled">cancelled</span>',
         error: `<span class="badge badge-error" title="${job.error || ''}">error</span>`,
+        interrupted: '<span class="badge badge-interrupted">interrupted</span>',
       };
-      const size = job.receivedBytes > 0 ? humanBytes(job.receivedBytes) : '';
+      let size = job.receivedBytes > 0 ? humanBytes(job.receivedBytes) : '';
+      if (job.state === 'interrupted' && job.totalBytes > 0) size += ` of ${humanBytes(job.totalBytes)}`;
+      let barHtml = '';
+      if (job.state === 'interrupted' && job.totalBytes > 0 && job.receivedBytes > 0) {
+        const pct = Math.min(100, (job.receivedBytes / job.totalBytes) * 100);
+        barHtml = `<div class="bar"><div class="fill" style="width:${pct}%"></div></div>`;
+      }
+      const resumeBtn = job.state === 'interrupted'
+        ? `<button data-resume="${job.id}">Resume</button>` : '';
       el.innerHTML = `
         <div class="job-line">
           <div class="job-url"></div>
           ${badges[job.state] || ''}
+          ${resumeBtn}
           <button class="lib-del" data-rmjob="${job.id}" title="Remove from history and delete the file">🗑</button>
         </div>
-        <div class="job-meta"><span>${size}</span><span>${job.file ? 'saved to ' + job.file : ''}</span><span>${job.error || ''}</span></div>`;
+        ${barHtml}
+        <div class="job-meta"><span>${size}</span><span>${job.file ? 'saved to ' + job.file : ''}</span><span>${job.error || (job.state === 'interrupted' ? 'stopped by server restart - partial file kept' : '')}</span></div>`;
     }
 
     const urlEl = el.querySelector('.job-url');
@@ -205,6 +216,13 @@ function renderJobs(jobs) {
   for (const btn of section.querySelectorAll('[data-cancel]')) {
     btn.addEventListener('click', async () => {
       try { await api('/api/jobs/' + btn.dataset.cancel, { method: 'DELETE' }); refreshJobs(true); }
+      catch (err) { alert(err.message); }
+    });
+  }
+
+  for (const btn of section.querySelectorAll('[data-resume]')) {
+    btn.addEventListener('click', async () => {
+      try { await api('/api/jobs/' + btn.dataset.resume + '/resume', { method: 'POST' }); refreshJobs(true); }
       catch (err) { alert(err.message); }
     });
   }

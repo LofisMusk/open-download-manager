@@ -46,3 +46,19 @@ jobs:
             ${{ startsWith(github.ref, 'refs/tags/v') && format('ghcr.io/lofismusk/open-download-manager:{0}', github.ref_name) || '' }}
             ${{ github.ref == 'refs/heads/main' && 'ghcr.io/lofismusk/open-download-manager:latest' || '' }}
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+  # Auto-deploy to the server after a successful image push. The address/user live in
+  # repo variables (DM_DEPLOY_HOST / DM_DEPLOY_USER) and the key in a secret, so no
+  # private IP ends up in this file. Skipped until DM_DEPLOY_HOST is set - it must be
+  # an address reachable from GitHub's runners (e.g. Tailscale or port forward).
+  deploy:
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DM_DEPLOY_HOST != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{ vars.DM_DEPLOY_HOST }}
+          username: ${{ vars.DM_DEPLOY_USER }}
+          key: ${{ secrets.DM_DEPLOY_SSH_KEY }}
+          command: cd /home/lofis/docker/download-manager && docker compose pull && docker compose up -d

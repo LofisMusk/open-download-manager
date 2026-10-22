@@ -2,7 +2,10 @@ name: open-download-manager
 
 services:
   download-manager:
-    build: .
+    # CI builds & pushes this image on every push to main (see .github/workflows/ci.yml).
+    # Deploy with: docker compose pull && docker compose up -d
+    # (for local development you can replace it with `build: .` instead)
+    image: ghcr.io/lofismusk/open-download-manager:latest
     container_name: open-download-manager
     restart: unless-stopped
     labels:
